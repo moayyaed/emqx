@@ -54,6 +54,17 @@
 -compile(nowarn_export_all).
 -endif.
 
+%% DB API
+-export([ mnesia/1
+        , get_persistent/1
+        , persist/4
+        , discard_persistent/1
+        , discard_persistent/2
+        ]).
+
+-boot_mnesia({mnesia, [boot]}).
+-copy_mnesia({mnesia, [copy]}).
+
 -export([init/1]).
 
 -export([ info/1
@@ -89,9 +100,17 @@
 %% Export for CT
 -export([set_field/3]).
 
--export_type([session/0]).
+-type sessionID() :: <<_:64>>. %% emqx_guid:guid()
+
+-export_type([ session/0
+             , sessionID/0
+             ]).
 
 -record(session, {
+          %% sessionID, fresh for all new sessions unless it is a resumed persistent session
+          id :: sessionID(),
+          %% Is this session a persistent session i.e. was it started with Session-Expiry > 0
+          is_persistent :: boolean(),
           %% Client’s Subscriptions.
           subscriptions :: map(),
           %% Max subscriptions allowed
@@ -129,7 +148,9 @@
 
 -type(replies() :: list(publish() | pubrel())).
 
--define(INFO_KEYS, [subscriptions,
+-define(INFO_KEYS, [id,
+                    is_persistent,
+                    subscriptions,
                     upgrade_qos,
                     retry_interval,
                     await_rel_timeout,
@@ -150,6 +171,8 @@
 
 -define(DEFAULT_BATCH_N, 1000).
 
+-define(MAX_EXPIRY_INTERVAL, 4294967295000). %% 16#FFFFFFFF * 1000
+
 -type options() :: #{ max_subscriptions => non_neg_integer()
                     , upgrade_qos => boolean()
                     , retry_interval => timeout()
@@ -158,6 +181,28 @@
                     , max_inflight => integer()
                     , mqueue => emqx_mqueue:options()
                     }.
+
+%%--------------------------------------------------------------------
+%% Mnesia bootstrap
+%%--------------------------------------------------------------------
+
+-define(SESSION_STORE, emqx_session_store).
+-record(session_store, { client_id        :: binary()
+                       , expiry_interval  :: non_neg_integer()
+                       , ts               :: non_neg_integer()
+                       , session          :: #session{}}).
+
+mnesia(boot) ->
+    ok = ekka_mnesia:create_table(?SESSION_STORE, [
+                {type, set},
+                {rlog_shard, ?PERSISTENT_SESSION_SHARD},
+                {ram_copies, [node()]},
+                {record_name, session_store},
+                {attributes, record_info(fields, session_store)},
+                {storage_properties, [{ets, [{read_concurrency, true}]}]}]);
+
+mnesia(copy) ->
+    ok = ekka_mnesia:copy_table(?SESSION_STORE, ram_copies).
 
 %%--------------------------------------------------------------------
 %% Init a Session
@@ -171,6 +216,8 @@ init(Opts) ->
                     store_qos0 => true
                    }, maps:get(mqueue, Opts, #{})),
     #session{
+       id                = emqx_guid:gen(),
+       is_persistent     = maps:get(is_persistent, Opts, false),
        max_subscriptions = maps:get(max_subscriptions, Opts, infinity),
        subscriptions     = #{},
        upgrade_qos       = maps:get(upgrade_qos, Opts, false),
@@ -185,6 +232,67 @@ init(Opts) ->
       }.
 
 %%--------------------------------------------------------------------
+%% DB API
+%%--------------------------------------------------------------------
+
+%% The timestamp (TS) is the last time a client interacted with the session,
+%% or when the client disconnected.
+-spec persist(binary() | 'undefined', non_neg_integer(), non_neg_integer(), #session{}) -> #session{}.
+persist(undefined,_ExpiryInterval,_TS, #session{} = Session) ->
+    Session;
+persist(_ClientID,_ExpiryInterval,_TS, #session{is_persistent = false} = Session) ->
+    Session;
+persist(ClientID, ExpiryInterval, TS, #session{} = Session) when is_binary(ClientID),
+                                                                 is_integer(ExpiryInterval) ->
+    SS = #session_store{ client_id       = ClientID
+                       , expiry_interval = ExpiryInterval
+                       , ts              = TS
+                       , session         = Session},
+    case persistent_session_status(SS) of
+        not_persistent -> Session;
+        expired        -> discard_persistent(ClientID, Session);
+        persistent     -> ekka_mnesia:dirty_write(?SESSION_STORE, SS),
+                          Session
+    end.
+
+get_persistent(ClientID) when is_binary(ClientID) ->
+    case mnesia:dirty_read(?SESSION_STORE, ClientID) of
+        [] -> [];
+        [#session_store{session = S} = SS] ->
+            case persistent_session_status(SS) of
+                not_persistent -> []; %% For completeness. Should not happen
+                expired        -> [];
+                persistent     -> [S]
+            end
+    end.
+
+%% @private [MQTT-3.1.2-23]
+persistent_session_status(#session_store{expiry_interval = 0}) ->
+    not_persistent;
+persistent_session_status(#session_store{expiry_interval = ?MAX_EXPIRY_INTERVAL}) ->
+    persistent;
+persistent_session_status(#session_store{expiry_interval = E, ts = TS}) ->
+    case E + TS > erlang:system_time(millisecond) of
+        true  -> persistent;
+        false -> expired
+    end.
+
+-spec discard_persistent(binary()) -> 'ok'.
+discard_persistent(ClientID) ->
+    case get_persistent(ClientID) of
+        [] -> ok;
+        [Session] ->
+            discard_persistent(ClientID, Session),
+            ok
+    end.
+
+-spec discard_persistent(binary(), #session{}) -> #session{}.
+discard_persistent(ClientID, #session{} = Session) ->
+    ekka_mnesia:dirty_delete(?SESSION_STORE, ClientID),
+    emqx_session_router:abandon(Session),
+    Session#session{is_persistent = false}.
+
+%%--------------------------------------------------------------------
 %% Info, Stats
 %%--------------------------------------------------------------------
 
@@ -195,6 +303,10 @@ info(Session) ->
 
 info(Keys, Session) when is_list(Keys) ->
     [{Key, info(Key, Session)} || Key <- Keys];
+info(id, #session{id = Id}) ->
+    Id;
+info(is_persistent, #session{is_persistent = Bool}) ->
+    Bool;
 info(subscriptions, #session{subscriptions = Subs}) ->
     Subs;
 info(subscriptions_cnt, #session{subscriptions = Subs}) ->
@@ -244,11 +356,13 @@ stats(Session) -> info(?STATS_KEYS, Session).
                 emqx_types:subopts(), session())
       -> {ok, session()} | {error, emqx_types:reason_code()}).
 subscribe(ClientInfo = #{clientid := ClientId}, TopicFilter, SubOpts,
-          Session = #session{subscriptions = Subs}) ->
+          Session = #session{id = SessionID, subscriptions = Subs}) ->
     IsNew = not maps:is_key(TopicFilter, Subs),
     case IsNew andalso is_subscriptions_full(Session) of
         false ->
             ok = emqx_broker:subscribe(TopicFilter, ClientId, SubOpts),
+            [emqx_session_router:do_add_route(TopicFilter, SessionID)
+             || Session#session.is_persistent],
             ok = emqx_hooks:run('session.subscribed',
                                 [ClientInfo, TopicFilter, SubOpts#{is_new => IsNew}]),
             {ok, Session#session{subscriptions = maps:put(TopicFilter, SubOpts, Subs)}};
@@ -268,10 +382,12 @@ is_subscriptions_full(#session{subscriptions = Subs,
 
 -spec(unsubscribe(emqx_types:clientinfo(), emqx_types:topic(), emqx_types:subopts(), session())
       -> {ok, session()} | {error, emqx_types:reason_code()}).
-unsubscribe(ClientInfo, TopicFilter, UnSubOpts, Session = #session{subscriptions = Subs}) ->
+unsubscribe(ClientInfo, TopicFilter, UnSubOpts, Session = #session{id = SessionID, subscriptions = Subs}) ->
     case maps:find(TopicFilter, Subs) of
         {ok, SubOpts} ->
             ok = emqx_broker:unsubscribe(TopicFilter),
+            [emqx_session_router:do_delete_route(SessionID, TopicFilter)
+             || Session#session.is_persistent],
             ok = emqx_hooks:run('session.unsubscribed', [ClientInfo, TopicFilter, maps:merge(SubOpts, UnSubOpts)]),
             {ok, Session#session{subscriptions = maps:remove(TopicFilter, Subs)}};
         error ->
@@ -637,7 +753,7 @@ terminate(ClientInfo, discarded, Session) ->
     run_hook('session.discarded', [ClientInfo, info(Session)]);
 terminate(ClientInfo, takeovered, Session) ->
     run_hook('session.takeovered', [ClientInfo, info(Session)]);
-terminate(ClientInfo, Reason, Session) ->
+terminate(#{clientid :=_ClientId} = ClientInfo, Reason, Session) ->
     run_hook('session.terminated', [ClientInfo, Reason, info(Session)]).
 
 -compile({inline, [run_hook/2]}).

@@ -179,7 +179,27 @@ set_conn_state(ConnState, Channel) ->
     Channel#channel{conn_state = ConnState}.
 
 set_session(Session, Channel) ->
-    Channel#channel{session = Session}.
+    %% Assume that this is also an updated session. Allow side effect.
+    NChannel = Channel#channel{session = Session},
+    maybe_persist_session(NChannel).
+
+maybe_persist_session(Channel = #channel{conninfo = ConnInfo, session = Session}) ->
+    case maps:get(clientid, Channel#channel.clientinfo, undefined) of
+        undefined -> Channel;
+        ClientID ->
+            case emqx_session:info(is_persistent, Session) of
+                false ->
+                    Channel;
+                true ->
+                    EI = maps:get(expiry_interval, ConnInfo, 0),
+                    TS = case maps:get(disconnected_at, ConnInfo, undefined) of
+                             undefined  -> erlang:system_time(millisecond);
+                             Disconnect -> Disconnect
+                         end,
+                    emqx_session:persist(ClientID, EI, TS, Channel#channel.session),
+                    Channel
+            end
+    end.
 
 %% TODO: Add more stats.
 -spec(stats(channel()) -> emqx_types:stats()).
@@ -731,8 +751,23 @@ process_disconnect(ReasonCode, Properties, Channel) ->
     {ok, {close, disconnect_reason(ReasonCode)}, NChannel}.
 
 maybe_update_expiry_interval(#{'Session-Expiry-Interval' := Interval},
-                             Channel = #channel{conninfo = ConnInfo}) ->
-    Channel#channel{conninfo = ConnInfo#{expiry_interval => timer:seconds(Interval)}};
+                             Channel = #channel{conninfo = ConnInfo, clientinfo = ClientInfo}) ->
+    EI = timer:seconds(Interval),
+    OldEI = maps:get(expiry_interval, ConnInfo, 0),
+    case OldEI =:= EI of
+        true -> Channel;
+        false ->
+            NChannel = Channel#channel{conninfo = ConnInfo#{expiry_interval => EI}},
+            ClientID = maps:get(clientid, ClientInfo, undefined),
+            %% Check if the client turns off persistence (turning it on is disallowed)
+            case EI =:= 0 andalso OldEI > 0 of
+                true ->
+                    S = emqx_session:discard_persistent(ClientID, NChannel#channel.session),
+                    set_session(S, NChannel);
+                false ->
+                    NChannel
+            end
+    end;
 maybe_update_expiry_interval(_Properties, Channel) -> Channel.
 
 %%--------------------------------------------------------------------
@@ -748,6 +783,10 @@ handle_deliver(Delivers, Channel = #channel{conn_state = disconnected,
     Delivers2 = ignore_local(Delivers1, ClientId, Session),
     NSession = emqx_session:enqueue(Delivers2, Session),
     NChannel = set_session(NSession, Channel),
+    %% We consider queued/dropped messages as delivered since they are now in the session state.
+    MsgIds = [emqx_message:id(Msg) || {deliver, _, Msg} <- Delivers],
+    SessionID = emqx_session:info(id, Session),
+    emqx_session_router:delivered(SessionID, MsgIds),
     {ok, NChannel};
 
 handle_deliver(Delivers, Channel = #channel{takeover = true,
@@ -758,10 +797,20 @@ handle_deliver(Delivers, Channel = #channel{takeover = true,
     {ok, Channel#channel{pendings = NPendings}};
 
 handle_deliver(Delivers, Channel = #channel{session = Session,
-                                            clientinfo = #{clientid := ClientId}}) ->
+                                            clientinfo = #{clientid := ClientId},
+                                            conninfo = #{expiry_interval := ExpiryInterval}
+                                           }) ->
     case emqx_session:deliver(ignore_local(Delivers, ClientId, Session), Session) of
         {ok, Publishes, NSession} ->
             NChannel = set_session(NSession, Channel),
+            case ExpiryInterval > 0 of
+                true ->
+                    MsgIds = [emqx_message:id(Msg) || {deliver, _, Msg} <- Delivers],
+                    SessionID = emqx_session:info(id, NSession),
+                    emqx_session_router:delivered(SessionID, MsgIds);
+                false ->
+                    ignore
+            end,
             handle_out(publish, Publishes, ensure_timer(retry_timer, NChannel));
         {ok, NSession} ->
             {ok, set_session(NSession, Channel)}
@@ -1129,9 +1178,11 @@ terminate(normal, Channel) ->
     run_terminate_hook(normal, Channel);
 terminate({shutdown, Reason}, Channel)
   when Reason =:= kicked; Reason =:= discarded; Reason =:= takeovered ->
+    [maybe_persist_session(Channel) || Reason =:= kicked],
     run_terminate_hook(Reason, Channel);
 terminate(Reason, Channel = #channel{will_msg = WillMsg}) ->
     (WillMsg =/= undefined) andalso publish_will_msg(WillMsg),
+    maybe_persist_session(Channel),
     run_terminate_hook(Reason, Channel).
 
 run_terminate_hook(_Reason, #channel{session = undefined}) -> ok;
@@ -1592,8 +1643,12 @@ maybe_resume_session(#channel{resuming = false}) ->
     ignore;
 maybe_resume_session(#channel{session  = Session,
                               resuming = true,
-                              pendings = Pendings}) ->
+                              pendings = Pendings,
+                              clientinfo = #{clientid := ClientId}}) ->
     {ok, Publishes, Session1} = emqx_session:replay(Session),
+    %% We consider queued/dropped messages as delivered since they are now in the session state.
+    MsgIds = [emqx_message:id(Msg) || {deliver, _, Msg} <- Pendings],
+    emqx_session_router:delivered(ClientId, MsgIds),
     case emqx_session:deliver(Pendings, Session1) of
         {ok, Session2} ->
             {ok, Publishes, Session2};

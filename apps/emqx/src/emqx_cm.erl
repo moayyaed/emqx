@@ -211,21 +211,38 @@ set_chan_stats(ClientId, ChanPid, Stats) ->
                 pendings => list()}}
        | {error, Reason :: term()}).
 open_session(true, ClientInfo = #{clientid := ClientId}, ConnInfo) ->
+    EI = maps:get(expiry_interval, ConnInfo, 0),
     Self = self(),
+    TS = erlang:system_time(millisecond),
     CleanStart = fun(_) ->
                      ok = discard_session(ClientId),
+                     ok = emqx_session:discard_persistent(ClientId),
                      Session = create_session(ClientInfo, ConnInfo),
+                     emqx_session:persist(ClientId, EI, TS, Session),
                      register_channel(ClientId, Self, ConnInfo),
                      {ok, #{session => Session, present => false}}
                  end,
     emqx_cm_locker:trans(ClientId, CleanStart);
 
 open_session(false, ClientInfo = #{clientid := ClientId}, ConnInfo) ->
+    EI = maps:get(expiry_interval, ConnInfo, 0),
     Self = self(),
+    TS = erlang:system_time(millisecond),
     ResumeStart = fun(_) ->
                       case takeover_session(ClientId) of
+                          {ok, Session} ->
+                              SessionID = emqx_session:info(id, Session),
+                              ok = emqx_session:resume(ClientInfo, Session),
+                              emqx_session:persist(ClientId, EI, TS, Session),
+                              Pendings = [{deliver, emqx_message:topic(Msg), Msg}
+                                          || Msg <- emqx_session_router:pending(SessionID)],
+                              register_channel(ClientId, Self, ConnInfo),
+                              {ok, #{session  => Session,
+                                     present  => true,
+                                     pendings => Pendings}};
                           {ok, ConnMod, ChanPid, Session} ->
                               ok = emqx_session:resume(ClientInfo, Session),
+                              emqx_session:persist(ClientId, EI, TS, Session),
                               Pendings = ConnMod:call(ChanPid, {takeover, 'end'}, ?T_TAKEOVER),
                               register_channel(ClientId, Self, ConnInfo),
                               {ok, #{session  => Session,
@@ -233,6 +250,7 @@ open_session(false, ClientInfo = #{clientid := ClientId}, ConnInfo) ->
                                      pendings => Pendings}};
                           {error, not_found} ->
                               Session = create_session(ClientInfo, ConnInfo),
+                              emqx_session:persist(ClientId, EI, TS, Session),
                               register_channel(ClientId, Self, ConnInfo),
                               {ok, #{session => Session, present => false}}
                       end
@@ -246,13 +264,17 @@ create_session(ClientInfo, ConnInfo) ->
     ok = emqx_hooks:run('session.created', [ClientInfo, emqx_session:info(Session)]),
     Session.
 
-get_session_confs(#{zone := Zone}, #{receive_maximum := MaxInflight}) ->
+get_session_confs(#{zone := Zone}, #{receive_maximum := MaxInflight, expiry_interval := EI}) ->
     #{max_subscriptions => get_mqtt_conf(Zone, max_subscriptions),
       upgrade_qos => get_mqtt_conf(Zone, upgrade_qos),
       max_inflight => MaxInflight,
       retry_interval => get_mqtt_conf(Zone, retry_interval),
       await_rel_timeout => get_mqtt_conf(Zone, await_rel_timeout),
-      mqueue => mqueue_confs(Zone)
+      mqueue => mqueue_confs(Zone),
+      %% TODO: Add conf for allowing/disallowing persistent sessions.
+      %% Note that the connection info is already enriched to have
+      %% default config values for session expiry.
+      is_persistent => EI > 0
      }.
 
 mqueue_confs(Zone) ->
@@ -271,7 +293,11 @@ get_mqtt_conf(Zone, Key) ->
        | {ok, atom(), pid(), emqx_session:session()}).
 takeover_session(ClientId) ->
     case lookup_channels(ClientId) of
-        [] -> {error, not_found};
+        [] ->
+            case emqx_session:get_persistent(ClientId) of
+                [] -> {error, not_found};
+                [Session] -> {ok, Session}
+            end;
         [ChanPid] ->
             takeover_session(ClientId, ChanPid);
         ChanPids ->
@@ -286,7 +312,10 @@ takeover_session(ClientId) ->
 takeover_session(ClientId, ChanPid) when node(ChanPid) == node() ->
     case get_chann_conn_mod(ClientId, ChanPid) of
         undefined ->
-            {error, not_found};
+            case emqx_session:get_persistent(ClientId) of
+                [] -> {error, not_found};
+                [Session] -> {ok, Session}
+            end;
         ConnMod when is_atom(ConnMod) ->
             Session = ConnMod:call(ChanPid, {takeover, 'begin'}, ?T_TAKEOVER),
             {ok, ConnMod, ChanPid, Session}
