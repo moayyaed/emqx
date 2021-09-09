@@ -780,7 +780,7 @@ handle_deliver(Delivers, Channel = #channel{conn_state = disconnected,
                                             session    = Session,
                                             clientinfo = #{clientid := ClientId}}) ->
     Delivers1 = maybe_nack(Delivers),
-    Delivers2 = ignore_local(Delivers1, ClientId, Session),
+    Delivers2 = emqx_session:ignore_local(Delivers1, ClientId, Session),
     NSession = emqx_session:enqueue(Delivers2, Session),
     NChannel = set_session(NSession, Channel),
     %% We consider queued/dropped messages as delivered since they are now in the session state.
@@ -793,14 +793,14 @@ handle_deliver(Delivers, Channel = #channel{takeover = true,
                                             pendings = Pendings,
                                             session = Session,
                                             clientinfo = #{clientid := ClientId}}) ->
-    NPendings = lists:append(Pendings, ignore_local(maybe_nack(Delivers), ClientId, Session)),
+    NPendings = lists:append(Pendings, emqx_session:ignore_local(maybe_nack(Delivers), ClientId, Session)),
     {ok, Channel#channel{pendings = NPendings}};
 
 handle_deliver(Delivers, Channel = #channel{session = Session,
                                             clientinfo = #{clientid := ClientId},
                                             conninfo = #{expiry_interval := ExpiryInterval}
                                            }) ->
-    case emqx_session:deliver(ignore_local(Delivers, ClientId, Session), Session) of
+    case emqx_session:deliver(emqx_session:ignore_local(Delivers, ClientId, Session), Session) of
         {ok, Publishes, NSession} ->
             NChannel = set_session(NSession, Channel),
             case ExpiryInterval > 0 of
@@ -815,19 +815,6 @@ handle_deliver(Delivers, Channel = #channel{session = Session,
         {ok, NSession} ->
             {ok, set_session(NSession, Channel)}
     end.
-
-ignore_local(Delivers, Subscriber, Session) ->
-    Subs = emqx_session:info(subscriptions, Session),
-    lists:dropwhile(fun({deliver, Topic, #message{from = Publisher}}) ->
-                        case maps:find(Topic, Subs) of
-                            {ok, #{nl := 1}} when Subscriber =:= Publisher ->
-                                ok = emqx_metrics:inc('delivery.dropped'),
-                                ok = emqx_metrics:inc('delivery.dropped.no_local'),
-                                true;
-                            _ ->
-                                false
-                        end
-                    end, Delivers).
 
 %% Nack delivers from shared subscription
 maybe_nack(Delivers) ->

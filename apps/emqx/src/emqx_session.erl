@@ -86,6 +86,7 @@
 -export([ deliver/2
         , enqueue/2
         , dequeue/1
+        , ignore_local/3
         , retry/1
         , terminate/3
         ]).
@@ -347,6 +348,23 @@ info(created_at, #session{created_at = CreatedAt}) ->
 %% @doc Get stats of the session.
 -spec(stats(session()) -> emqx_types:stats()).
 stats(Session) -> info(?STATS_KEYS, Session).
+
+%%--------------------------------------------------------------------
+%% Ignore local messages
+%%--------------------------------------------------------------------
+
+ignore_local(Delivers, Subscriber, Session) ->
+    Subs = emqx_session:info(subscriptions, Session),
+    lists:dropwhile(fun({deliver, Topic, #message{from = Publisher}}) ->
+                        case maps:find(Topic, Subs) of
+                            {ok, #{nl := 1}} when Subscriber =:= Publisher ->
+                                ok = emqx_metrics:inc('delivery.dropped'),
+                                ok = emqx_metrics:inc('delivery.dropped.no_local'),
+                                true;
+                            _ ->
+                                false
+                        end
+                    end, Delivers).
 
 %%--------------------------------------------------------------------
 %% Client -> Broker: SUBSCRIBE
