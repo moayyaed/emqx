@@ -231,15 +231,42 @@ open_session(false, ClientInfo = #{clientid := ClientId}, ConnInfo) ->
     ResumeStart = fun(_) ->
                       case takeover_session(ClientId) of
                           {ok, Session} ->
+                              %% This is a persistent session without
+                              %% a managing process.
                               SessionID = emqx_session:info(id, Session),
-                              ok = emqx_session:resume(ClientInfo, Session),
-                              emqx_session:persist(ClientId, EI, TS, Session),
-                              Pendings = [{deliver, emqx_message:topic(Msg), Msg}
-                                          || Msg <- emqx_session_router:pending(SessionID)],
+                              %% NOTE: Order is important!
+
+                              %% 1. Get pending messages from DB.
+                              Pendings1 = get_pendings_from_db(SessionID),
+                              Pendings2 = emqx_session:ignore_local(Pendings1, ClientId, Session),
+
+                              %% 2. Enqueue messages to mimic that the process was alive
+                              %%    when the messages were delivered.
+                              Session1 = emqx_session:enqueue(Pendings2, Session),
+
+                              %% 3. Notify writers that we are resuming.
+                              %%    They will buffer new messages.
+                              NodeMarkers = emqx_session_router:resume_begin(SessionID),
+
+                              %% 4. Subscribe to topics.
+                              ok = emqx_session:resume(ClientInfo, Session1),
+                              emqx_session:persist(ClientId, EI, TS, Session1),
+
+                              %% 5. Get pending messages from DB until we find all markers.
+                              MarkerIDs = [Marker || {_, Marker} <- NodeMarkers],
+
+                              Pendings3 = get_pendings_from_db(SessionID, MarkerIDs),
+                              Pendings4 = emqx_session:ignore_local(Pendings3, ClientId, Session),
+
+                              %% 6. Get pending messages from writers.
+                              WriterPendings = emqx_session_router:resume_end(SessionID),
                               register_channel(ClientId, Self, ConnInfo),
-                              {ok, #{session  => Session,
+
+                              %% 7. Drain the inbox and usort the messages
+                              %%    with the pending messages. (Should be done by caller.)
+                              {ok, #{session  => Session1,
                                      present  => true,
-                                     pendings => Pendings}};
+                                     pendings => Pendings4 ++ WriterPendings}};
                           {ok, ConnMod, ChanPid, Session} ->
                               ok = emqx_session:resume(ClientInfo, Session),
                               emqx_session:persist(ClientId, EI, TS, Session),
@@ -256,6 +283,19 @@ open_session(false, ClientInfo = #{clientid := ClientId}, ConnInfo) ->
                       end
                   end,
     emqx_cm_locker:trans(ClientId, ResumeStart).
+
+get_pendings_from_db(SessionID) ->
+    get_pendings_from_db(SessionID, []).
+
+get_pendings_from_db(SessionID, MarkerIds) ->
+    case emqx_session_router:pending(SessionID) of
+        incomplete ->
+            timer:sleep(10),
+            get_pendings_from_db(SessionID, MarkerIds);
+        Messages ->
+            [{deliver, emqx_message:topic(Msg), Msg}
+             || Msg <- Messages]
+    end.
 
 create_session(ClientInfo, ConnInfo) ->
     Options = get_session_confs(ClientInfo, ConnInfo),

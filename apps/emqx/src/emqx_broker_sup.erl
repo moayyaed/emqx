@@ -51,5 +51,16 @@ init([]) ->
                type => worker,
                modules => [emqx_broker_helper]},
 
-    {ok, {{one_for_all, 0, 1}, [BrokerPool, SharedSub, Helper]}}.
+    %% We want this supervisor to own the table for restarts
+    SessionTab = emqx_session_router:create_init_tab(),
+
+    %% Resume worker sup
+    ResumeSup = #{id => router_worker_sup,
+                  start => {emqx_session_router_worker_sup, start_link, [SessionTab]},
+                  restart => permanent,
+                  shutdown => 2000,
+                  type => supervisor,
+                  modules => [emqx_session_router_worker_sup]},
+
+    {ok, {{one_for_all, 0, 1}, [ResumeSup, BrokerPool, SharedSub, Helper]}}.
 

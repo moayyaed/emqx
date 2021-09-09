@@ -39,6 +39,7 @@ init([]) ->
                                      {emqx_router, start_link, []}]),
 
     %% TODO: Should this be optional?
+    emqx_session_router:create_init_tab(), %% We want the supervisor to own the table for persistence
     SessionRouterPool = emqx_pool_sup:spec(session_router_pool,
                                            [session_router_pool, hash,
                                             {emqx_session_router, start_link, []}]),
