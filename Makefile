@@ -70,6 +70,8 @@ $(foreach app,$(APPS),$(eval $(call gen-app-prop-target,$(app))))
 ct-suite: $(REBAR)
 ifneq ($(TESTCASE),)
 	$(REBAR) ct -v --readable=false --name $(CT_NODE_NAME) --suite $(SUITE)  --case $(TESTCASE)
+else ifneq ($(GROUP),)
+	$(REBAR) ct -v --readable=false --name $(CT_NODE_NAME) --suite $(SUITE)  --group $(GROUP)
 else
 	$(REBAR) ct -v --readable=false --name $(CT_NODE_NAME) --suite $(SUITE)
 endif
