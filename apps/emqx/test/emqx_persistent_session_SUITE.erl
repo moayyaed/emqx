@@ -52,20 +52,13 @@ groups() ->
     ].
 
 init_per_group(tcp, Config) ->
-    emqx_ct_helpers:start_apps([]),
-    [ {port, 1883}, {conn_fun, connect},  {kill_connection_process, true}| Config];
+    [ {port, 1883}, {conn_fun, connect}| Config];
 init_per_group(no_kill_connection_process, Config) ->
-    emqx_ct_helpers:start_apps([]),
     [ {kill_connection_process, false} | Config];
 init_per_group(kill_connection_process, Config) ->
-    emqx_ct_helpers:start_apps([]),
     [ {kill_connection_process, true} | Config];
 init_per_group(quic, Config) ->
-    emqx_ct_helpers:start_apps([]),
-    [ {port, 14567}, {conn_fun, quic_connect} | Config];
-init_per_group(_, Config) ->
-    emqx_ct_helpers:stop_apps([]),
-    Config.
+    [ {port, 14567}, {conn_fun, quic_connect} | Config].
 
 init_per_suite(Config) ->
     %% Start Apps
@@ -86,9 +79,10 @@ end_per_group(_Group, _Config) ->
     ok.
 
 init_per_testcase(TestCase, Config) ->
+    Config1 = preconfig_per_testcase(TestCase, Config),
     case erlang:function_exported(?MODULE, TestCase, 2) of
-        true -> ?MODULE:TestCase(init, Config);
-        _ -> Config
+        true -> ?MODULE:TestCase(init, Config1);
+        _ -> Config1
     end.
 
 end_per_testcase(TestCase, Config) ->
@@ -97,6 +91,25 @@ end_per_testcase(TestCase, Config) ->
         false -> ok
     end,
     Config.
+
+preconfig_per_testcase(TestCase, Config) ->
+    {BaseName, Config1} =
+        case ?config(tc_group_properties, Config) of
+            [] ->
+                %% We are running a single testcase
+                {atom_to_binary(TestCase),
+                 init_per_group(tcp, init_per_group(kill_connection_process, Config))};
+            [{name, GroupName}] ->
+                [[{name,TopName}]] = ?config(tc_group_path, Config),
+                {iolist_to_binary([atom_to_binary(TopName), "_",
+                                   atom_to_binary(GroupName), "_",
+                                   atom_to_binary(TestCase)]),
+                 Config}
+        end,
+    [ {topic, iolist_to_binary([BaseName, "/foo"])}
+    , {stopic, iolist_to_binary([BaseName, "/+"])}
+    , {client_id, BaseName}
+    | Config1].
 
 %%--------------------------------------------------------------------
 %% Helpers
@@ -150,9 +163,9 @@ publish(Topic, Payload, Config) ->
 %% [MQTT-3.1.2-23]
 t_connect_session_expiry_interval(Config) ->
     ConnFun = ?config(conn_fun, Config),
-    Topic = <<"t_connect_session_expiry_interval/foo">>,
+    Topic = ?config(topic, Config),
     Payload = <<"test message">>,
-    ClientId = <<"t_connect_session_expiry_interval">>,
+    ClientId = ?config(client_id, Config),
 
     {ok, Client1} = emqtt:start_link([ {clientid, ClientId},
                                        {proto_ver, v5},
@@ -213,7 +226,7 @@ t_cancel_on_disconnect(Config) ->
     %% Open a persistent session, but cancel the persistence when
     %% shutting down the connection.
     ConnFun = ?config(conn_fun, Config),
-    ClientId = <<"t_cancel_on_disconnect">>,
+    ClientId = ?config(client_id, Config),
 
     {ok, Client1} = emqtt:start_link([ {proto_ver, v5},
                                        {clientid, ClientId},
@@ -237,7 +250,7 @@ t_persist_on_disconnect(Config) ->
     %% shutting down the connection. This is a protocol error, and
     %% should not convert the session into a persistent session.
     ConnFun = ?config(conn_fun, Config),
-    ClientId = <<"t_persist_on_disconnect">>,
+    ClientId = ?config(client_id, Config),
 
     {ok, Client1} = emqtt:start_link([ {proto_ver, v5},
                                        {clientid, ClientId},
@@ -260,13 +273,12 @@ t_persist_on_disconnect(Config) ->
     ?assertEqual(0, client_info(session_present, Client2)),
     ok = emqtt:disconnect(Client2).
 
-
 t_process_dies_session_expires(Config) ->
     %% Emulate an error in the connect process,
     %% or that the node of the process goes down.
     %% A persistent session should eventually expire.
     ConnFun = ?config(conn_fun, Config),
-    ClientId = <<"t_process_dies_session_expires">>,
+    ClientId = ?config(client_id, Config),
     {ok, Client1} = emqtt:start_link([ {proto_ver, v5},
                                        {clientid, ClientId},
                                        {properties, #{'Session-Expiry-Interval' => 1}},
@@ -291,11 +303,11 @@ t_publish_while_client_is_gone(Config) ->
     %% A persistent session should receive messages in its
     %% subscription even if the process owning the session dies.
     ConnFun = ?config(conn_fun, Config),
-    Topic = <<"t_publish_while_client_is_gone/bar">>,
-    STopic = <<"t_publish_while_client_is_gone/+">>,
+    Topic = ?config(topic, Config),
+    STopic = ?config(stopic, Config),
     Payload1 = <<"hello1">>,
     Payload2 = <<"hello2">>,
-    ClientId = <<"t_publish_while_client_is_gone">>,
+    ClientId = ?config(client_id, Config),
     {ok, Client1} = emqtt:start_link([ {proto_ver, v5},
                                        {clientid, ClientId},
                                        {properties, #{'Session-Expiry-Interval' => 30}},
@@ -333,12 +345,12 @@ t_clean_start_drops_subscriptions(Config) ->
     %% The original message should not be delivered.
 
     ConnFun = ?config(conn_fun, Config),
-    Topic = <<"t_clean_start_drops_subscriptions/bar">>,
-    STopic = <<"t_clean_start_drops_subscriptions/+">>,
+    Topic = ?config(topic, Config),
+    STopic = ?config(stopic, Config),
     Payload1 = <<"hello1">>,
     Payload2 = <<"hello2">>,
     Payload3 = <<"hello3">>,
-    ClientId = <<"t_clean_start_drops_subscriptions">>,
+    ClientId = ?config(client_id, Config),
 
     %% 1.
     {ok, Client1} = emqtt:start_link([ {proto_ver, v5},
