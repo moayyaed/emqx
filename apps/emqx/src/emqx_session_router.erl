@@ -22,6 +22,8 @@
 -include("logger.hrl").
 -include("types.hrl").
 
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
+
 %% Mnesia bootstrap
 -export([mnesia/1]).
 
@@ -246,17 +248,19 @@ resume_begin_rpc_endpoint(From, SessionID) when is_pid(From), is_binary(SessionI
 resume_end(SessionID) ->
     Nodes = ekka_mnesia:running_nodes(),
     Res = erpc:multicall(Nodes, ?MODULE, resume_end_rpc_endpoint, [self(), SessionID]),
+    ?tp(ps_resume, #{ event => erpc_multical_result, res => Res, sid => SessionID }),
     %% TODO: Should handle the errors
-    lists:append([ Messages || {ok, Messages} <- Res]).
+    lists:append([ Messages || {ok, {ok, Messages}} <- Res]).
 
 -spec resume_end_rpc_endpoint(pid(), binary()) ->
           {'ok', [emqx_types:message()]} | {'error', term()}.
 resume_end_rpc_endpoint(From, SessionID) when is_pid(From), is_binary(SessionID) ->
     case emqx_tables:lookup_value(?SESSION_INIT_TAB, SessionID) of
         undefined ->
+            ?tp(ps_resume, #{ event => session_not_found, sid => SessionID }),
             {error, not_found};
         Pid ->
-            Res = emq_session_router_worker:resume_end(From, Pid),
+            Res = emqx_session_router_worker:resume_end(From, Pid, SessionID),
             cast(pick(SessionID), {resume_end, SessionID, Pid}),
             Res
     end.
@@ -313,11 +317,11 @@ handle_cast({abandon, SessionID, Subscriptions}, State) ->
 handle_cast({resume_end, SessionID, Pid}, State) ->
     case emqx_tables:lookup_value(?SESSION_INIT_TAB, SessionID) of
         undefined -> skip;
-        {_, P} when P =:= Pid -> ets:delete(?SESSION_INIT_TAB, SessionID);
-        {_,_P} -> skip
+        P when P =:= Pid -> ets:delete(?SESSION_INIT_TAB, SessionID);
+        P when is_pid(P) -> skip
     end,
     Pmon = emqx_pmon:demonitor(Pid, maps:get(pmon, State)),
-    emqx_session_router_sup:abort_worker(Pid),
+    emqx_session_router_worker_sup:abort_worker(Pid),
     {noreply, State#{ pmon => Pmon }};
 handle_cast(Msg, State) ->
     ?LOG(error, "Unexpected cast: ~p", [Msg]),
@@ -387,7 +391,6 @@ pending_messages(SessionID, MarkerIds) ->
 %% We traverse the table until we reach another session.
 %% TODO: Garbage collect the delivered messages.
 pending_messages(SessionID, PrevMsgId, PrevTag, Acc, MarkerIds) ->
-    %% ct:pal("MarkerIds: ~p", [MarkerIds]),
     case mnesia:dirty_next(?SESS_MSG_TAB, {SessionID, PrevMsgId, PrevTag}) of
         {S, <<>>, ?ABANDONED} when S =:= SessionID ->
             {[], []};

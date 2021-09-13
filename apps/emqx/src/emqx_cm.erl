@@ -234,31 +234,38 @@ open_session(false, ClientInfo = #{clientid := ClientId}, ConnInfo) ->
                               %% This is a persistent session without
                               %% a managing process.
                               SessionID = emqx_session:info(id, Session),
+                              ?tp(ps_resume, #{event => resuming, from => db, sid => SessionID}),
+
                               %% NOTE: Order is important!
 
                               %% 1. Get pending messages from DB.
+                              ?tp(ps_resume, #{event => initial_pendings, sid => SessionID}),
                               Pendings1 = get_pendings_from_db(SessionID),
                               Pendings2 = emqx_session:ignore_local(Pendings1, ClientId, Session),
 
                               %% 2. Enqueue messages to mimic that the process was alive
                               %%    when the messages were delivered.
+                              ?tp(ps_resume, #{event => persist_pendings, sid => SessionID}),
                               Session1 = emqx_session:enqueue(Pendings2, Session),
+                              emqx_session:persist(ClientId, EI, TS, Session1),
 
                               %% 3. Notify writers that we are resuming.
                               %%    They will buffer new messages.
+                              ?tp(ps_resume, #{event => notify_writers, sid => SessionID}),
                               NodeMarkers = emqx_session_router:resume_begin(SessionID),
 
                               %% 4. Subscribe to topics.
+                              ?tp(ps_resume, #{event => resume_session, sid => SessionID}),
                               ok = emqx_session:resume(ClientInfo, Session1),
-                              emqx_session:persist(ClientId, EI, TS, Session1),
 
                               %% 5. Get pending messages from DB until we find all markers.
+                              ?tp(ps_resume, #{event => marker_pendings, sid => SessionID}),
                               MarkerIDs = [Marker || {_, Marker} <- NodeMarkers],
-
                               Pendings3 = get_pendings_from_db(SessionID, MarkerIDs),
                               Pendings4 = emqx_session:ignore_local(Pendings3, ClientId, Session),
 
                               %% 6. Get pending messages from writers.
+                              ?tp(ps_resume, #{event => resume_end, sid => SessionID}),
                               WriterPendings = emqx_session_router:resume_end(SessionID),
                               register_channel(ClientId, Self, ConnInfo),
 

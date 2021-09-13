@@ -18,6 +18,7 @@
 
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -compile(export_all).
 -compile(nowarn_export_all).
@@ -29,6 +30,7 @@
 all() ->
     [ {group, kill_connection_process}
     , {group, no_kill_connection_process}
+    , {group, snabbkaffe}
     ].
 
 %% A persistent session can be resumed in two ways:
@@ -45,20 +47,28 @@ all() ->
 
 groups() ->
     TCs = emqx_ct:all(?MODULE),
+    SnabbkaffeTCs = [TC || TC <- TCs, re:run(atom_to_list(TC), "snabbkaffe") /= nomatch],
+    OtherTCs = TCs -- SnabbkaffeTCs,
     [ {no_kill_connection_process, [], [{group, tcp}, {group, quic}]}
     , {   kill_connection_process, [], [{group, tcp}, {group, quic}]}
-    , {tcp,  [], TCs}
-    , {quic, [], TCs}
+    , {snabbkaffe, [], [{group, tcp_snabbkaffe}, {group, quic_snabbkaffe}]}
+    , {tcp,  [], OtherTCs}
+    , {quic, [], OtherTCs}
+    , {tcp_snabbkaffe,  [], SnabbkaffeTCs}
+    , {quic_snabbkaffe, [], SnabbkaffeTCs}
     ].
 
-init_per_group(tcp, Config) ->
+init_per_group(Group, Config) when Group == tcp; Group == tcp_snabbkaffe ->
     [ {port, 1883}, {conn_fun, connect}| Config];
+init_per_group(Group, Config) when Group == quic; Group == quic_snabbkaffe ->
+    [ {port, 14567}, {conn_fun, quic_connect} | Config];
 init_per_group(no_kill_connection_process, Config) ->
     [ {kill_connection_process, false} | Config];
 init_per_group(kill_connection_process, Config) ->
     [ {kill_connection_process, true} | Config];
-init_per_group(quic, Config) ->
-    [ {port, 14567}, {conn_fun, quic_connect} | Config].
+init_per_group(snabbkaffe, Config) ->
+    [ {kill_connection_process, true} | Config].
+
 
 init_per_suite(Config) ->
     %% Start Apps
@@ -397,3 +407,68 @@ t_clean_start_drops_subscriptions(Config) ->
     ?assertEqual({ok, iolist_to_binary(Payload3)}, maps:find(payload, Msg2)),
 
     ok = emqtt:disconnect(Client3).
+
+t_snabbkaffe_vanilla_stages(Config) ->
+    %% Test that all stages of session resume works ok in the simplest case
+    process_flag(trap_exit, true),
+    ConnFun = ?config(conn_fun, Config),
+    ClientId = ?config(client_id, Config),
+    {ok, Client1} = emqtt:start_link([ {proto_ver, v5},
+                                       {clientid, ClientId},
+                                       {properties, #{'Session-Expiry-Interval' => 30}},
+                                       {clean_start, true}
+                                     | Config]),
+    {ok, _} = emqtt:ConnFun(Client1),
+
+    ok = emqtt:disconnect(Client1),
+    maybe_kill_connection_process(ClientId, Config),
+
+    ok = snabbkaffe:start_trace(),
+    {ok, Client2} = emqtt:start_link([ {proto_ver, v5},
+                                       {clientid, ClientId},
+                                       {properties, #{'Session-Expiry-Interval' => 30}},
+                                       {clean_start, false}
+                                     | Config]),
+    try
+        {ok, _} = emqtt:ConnFun(Client2),
+        ok = emqtt:disconnect(Client2)
+    catch Err:What:ST ->
+            ct:log("Trace: ~p", [snabbkaffe:collect_trace(1000)]),
+            erlang:raise(Err, What, ST)
+    end,
+    Trace = snabbkaffe:collect_trace(1000),
+    ResumeTrace = ?of_kind(ps_resume, Trace),
+    [_Sid] = lists:usort(?projection(sid, ResumeTrace)),
+
+    %% Check internal flow of the emqx_cm resuming
+    ?assert(?strict_causality(#{ event := resuming },
+                              #{ event := initial_pendings },
+                              ResumeTrace)),
+    ?assert(?strict_causality(#{ event := initial_pendings },
+                              #{ event := persist_pendings },
+                              ResumeTrace)),
+    ?assert(?strict_causality(#{ event := persist_pendings },
+                              #{ event := notify_writers },
+                              ResumeTrace)),
+    ?assert(?strict_causality(#{ event := notify_writers },
+                              #{ event := resume_session },
+                              ResumeTrace)),
+    ?assert(?strict_causality(#{ event := resume_session },
+                              #{ event := marker_pendings },
+                              ResumeTrace)),
+    ?assert(?strict_causality(#{ event := marker_pendings },
+                              #{ event := resume_end },
+                              ResumeTrace)),
+
+    %% Check flow between worker and emqx_cm
+    ?assert(?strict_causality(#{ event := notify_writers },
+                              #{ event := worker_started },
+                              ResumeTrace)),
+    ?assert(?strict_causality(#{ event := marker_pendings },
+                              #{ event := worker_resume_end },
+                              ResumeTrace)),
+    ?assert(?strict_causality(#{ event := worker_resume_end },
+                              #{ event := worker_shutdown },
+                              ResumeTrace)),
+
+    ok.

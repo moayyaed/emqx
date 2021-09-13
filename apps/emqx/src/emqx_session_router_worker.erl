@@ -33,7 +33,7 @@
 
 %% API
 -export([ pendings/1
-        , resume_end/2
+        , resume_end/3
         , start_link/2
         ]).
 
@@ -45,9 +45,7 @@
         , terminate/2
         ]).
 
--include("logger.hrl").
-
--define(SERVER, ?MODULE).
+-include_lib("snabbkaffe/include/snabbkaffe.hrl").
 
 -record(state, { remote_pid :: pid()
                , session_id :: binary()
@@ -66,11 +64,20 @@ start_link(SessionTab, #{} = Opts) ->
 pendings(Pid) ->
     gen_server:call(Pid, pendings).
 
-resume_end(RemotePid, Pid) ->
+resume_end(RemotePid, Pid, _SessionID) ->
     case gen_server:call(Pid, {resume_end, RemotePid}) of
         {ok, EtsHandle} ->
+            ?tp(ps_resume, #{ event => worker_call_ok
+                            , pid => Pid
+                            , remote_pid => RemotePid
+                            , sid => _SessionID}),
             {ok, ets:tab2list(EtsHandle)};
         {error, _} = Err ->
+            ?tp(ps_resume, #{ event => worker_call_failed
+                            , pid => Pid
+                            , remote_pid => RemotePid
+                            , sid => _SessionID
+                            , reason => Err}),
             Err
     end.
 
@@ -82,7 +89,10 @@ init(#{ remote_pid  := RemotePid
       , session_id  := SessionID
       , session_tab := SessionTab}) ->
     process_flag(trap_exit, true),
-    link(RemotePid),
+    erlang:monitor(process, RemotePid),
+    ?tp(ps_resume, #{ event => worker_started
+                    , remote_pid => RemotePid
+                    , sid => SessionID }),
     {ok, #state{ remote_pid = RemotePid
                , session_id = SessionID
                , session_tab = SessionTab
@@ -93,8 +103,12 @@ init(#{ remote_pid  := RemotePid
 handle_call(pendings, _From, State) ->
     %% Debug API
     {reply, {State#state.messages, State#state.remote_pid}, State};
-handle_call(resume_end, _From, State) ->
-    {reply, {State#state.messages, State#state.remote_pid}, State};
+handle_call({resume_end, RemotePid}, _From, #state{remote_pid = RemotePid} = State) ->
+    ?tp(ps_resume, #{ event => worker_resume_end, sid => State#state.session_id }),
+    {reply, {ok, State#state.messages}, State#state{ buffering = false }};
+handle_call({resume_end, _RemotePid}, _From, State) ->
+    ?tp(ps_resume, #{ event => worker_resume_end_error, sid => State#state.session_id }),
+    {reply, {error, wrong_remote_pid}, State};
 handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
@@ -102,17 +116,29 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Request, State) ->
     {noreply, State}.
 
+handle_info({deliver, _Msg}, State) when not State#state.buffering ->
+    ?tp(ps_resume, #{ event => worker_drop_deliver
+                    , sid => State#state.session_id
+                    , msg_id => emqx_message:id(_Msg)
+                    }),
+    {noreply, State};
 handle_info({deliver, Msg}, State) when State#state.buffering ->
+    ?tp(ps_resume, #{ event => worker_deliver
+                    , sid => State#state.session_id
+                    , msg_id => emqx_message:id(Msg)
+                    }),
     ets:insert(State#state.messages, Msg),
     {noreply, State};
-handle_info({'EXIT', RemotePid, _}, #state{remote_pid = RemotePid} = State) ->
-    ?SLOG(warning, #{msg => "Remote pid died. Exiting."}),
+handle_info({'DOWN', _, process, RemotePid, _Reason}, #state{remote_pid = RemotePid} = State) ->
+    ?tp(warning, #{ event => worker_remote_died
+                  , sid => State#state.session_id
+                  , msg => "Remote pid died. Exiting." }),
     {stop, normal, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(shutdown, _State) ->
-    ?SLOG(debug, #{msg => "Shutdown on request"}),
+    ?tp(ps_resume, #{ event => worker_shutdown, sid => _State#state.session_id }),
     ok;
 terminate(_, _State) ->
     ok.
